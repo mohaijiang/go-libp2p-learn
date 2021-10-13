@@ -1,4 +1,4 @@
-module p2pssh
+module github.com/mohaijiang/go-libp2p-learn
 
 go 1.17
 
