@@ -6,7 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/routing"
 
 	"io"
 	"log"
@@ -19,8 +19,19 @@ import (
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	dual "github.com/libp2p/go-libp2p-kad-dht/dual"
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+var DefaultBootstrapAddresses = []string{
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+	"/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+	"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",      // mars.i.ipfs.io
+	"/ip4/104.131.131.82/udp/4001/quic/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ", // mars.i.ipfs.io
+}
 
 type P2pStream interface {
 	// Read reads data from the connection.
@@ -82,6 +93,9 @@ func main() {
 // given multiaddress. It will use secio if secio is true.
 func makeBasicHost(listenPort int, secio bool, randseed int64) (host.Host, error) {
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	defer cancel()
 	// If the seed is zero, use real cryptographic randomness. Otherwise, use a
 	// deterministic randomness source to make generated keys stay the same
 	// across multiple runs
@@ -99,11 +113,25 @@ func makeBasicHost(listenPort int, secio bool, randseed int64) (host.Host, error
 		return nil, err
 	}
 
-	opts := []libp2p.Option{
+	opts := []libp2p.Option{libp2p.NoListenAddrs}
+	bootstraps, err := DefaultBootstrapPeers()
+	if err != nil {
+		log.Fatalln(err)
+	}
+	opts = append(opts,
 		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", listenPort)),
 		libp2p.Identity(priv),
-		libp2p.EnableRelay(),
-	}
+		libp2p.Routing(func(host host.Host) (routing.PeerRouting, error) {
+			return dual.New(
+				ctx, host,
+				dual.DHTOption(
+					dht.Concurrency(10),
+					dht.Mode(dht.ModeAuto),
+				),
+				dual.WanDHTOption(dht.BootstrapPeers(bootstraps...)),
+			)
+		}),
+	)
 
 	basicHost, err := libp2p.New(opts...)
 	if err != nil {
@@ -165,7 +193,7 @@ func startServer(ctx context.Context, ha host.Host, listenPort int, insecure boo
 	}
 }
 
-func runClient(ha host.Host, proxyPort int, target string) {
+func runClient(ha host.Host, proxyPort int, pid string) {
 
 	log.Println("sender opening stream")
 	// make a new stream from host B to host A
@@ -173,32 +201,11 @@ func runClient(ha host.Host, proxyPort int, target string) {
 	// we use the same /echo/1.0.0 protocol
 	// The following code extracts target's the peer ID from the
 	// given multiaddress
-	ipfsaddr, err := ma.NewMultiaddr(target)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	pid, err := ipfsaddr.ValueForProtocol(ma.P_IPFS)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
 	peerid, err := peer.Decode(pid)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-
-	// Decapsulate the /ipfs/<peerID> part from the target
-	// /ip4/<a.b.c.d>/ipfs/<peer> becomes /ip4/<a.b.c.d>
-	targetPeerAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/ipfs/%s", pid))
-	targetAddr := ipfsaddr.Decapsulate(targetPeerAddr)
-
-	// We have a peer ID and a targetAddr so we add it to the peerstore
-	// so LibP2P knows how to contact it
-	ha.Peerstore().AddAddr(peerid, targetAddr, peerstore.PermanentAddrTTL)
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", proxyPort))
 	if err != nil {
@@ -268,4 +275,26 @@ func ProxyP2p(from P2pStream, to P2pStream, closed chan bool) {
 			return
 		}
 	}
+}
+
+func DefaultBootstrapPeers() ([]peer.AddrInfo, error) {
+	ps, err := ParseBootstrapPeers(DefaultBootstrapAddresses)
+	if err != nil {
+		return nil, fmt.Errorf(`failed to parse hardcoded bootstrap peers: %s
+This is a problem with the ipfs codebase. Please report it to the dev team`, err)
+	}
+	return ps, nil
+}
+
+// ParseBootstrapPeer parses a bootstrap list into a list of AddrInfos.
+func ParseBootstrapPeers(addrs []string) ([]peer.AddrInfo, error) {
+	maddrs := make([]ma.Multiaddr, len(addrs))
+	for i, addr := range addrs {
+		var err error
+		maddrs[i], err = ma.NewMultiaddr(addr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return peer.AddrInfosFromP2pAddrs(maddrs...)
 }
